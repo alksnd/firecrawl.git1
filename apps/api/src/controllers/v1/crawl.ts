@@ -21,6 +21,7 @@ import { checkPermissions } from "../../lib/permissions";
 import { crawlGroup } from "../../services/worker/nuq";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -135,9 +136,14 @@ export async function crawlController(
     createdAt: Date.now(),
     maxConcurrency:
       req.body.maxConcurrency !== undefined
-        ? req.acuc?.concurrency !== undefined
-          ? Math.min(req.body.maxConcurrency, req.acuc.concurrency)
-          : req.body.maxConcurrency
+        ? Math.min(
+            req.body.maxConcurrency,
+            await getEffectiveConcurrencyLimit(
+              req.auth.team_id,
+              req.acuc?.concurrency,
+              req.acuc?.org_id,
+            ),
+          )
         : undefined,
     zeroDataRetention,
   };

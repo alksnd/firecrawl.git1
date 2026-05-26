@@ -23,6 +23,7 @@ import { logRequest } from "../../services/logging/log_job";
 import { getErrorContactMessage } from "../../lib/deployment";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 
 export async function scrapeController(
   req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
@@ -123,7 +124,11 @@ export async function scrapeController(
     doc = await teamConcurrencySemaphore.withSemaphore(
       req.auth.team_id,
       jobId,
-      req.acuc?.concurrency || 1,
+      (await getEffectiveConcurrencyLimit(
+        req.auth.team_id,
+        req.acuc?.concurrency,
+        req.acuc?.org_id,
+      )) || 1,
       aborter.signal,
       timeout ?? 60_000,
       async limited => {

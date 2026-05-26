@@ -23,6 +23,7 @@ import { buildPromptWithWebsiteStructure } from "../../lib/map-utils";
 import { crawlGroup } from "../../services/worker/nuq";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -179,6 +180,11 @@ export async function crawlController(
     originalBodyLimit: preNormalizedBody.limit,
   });
 
+  const effectiveConcurrency = await getEffectiveConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc?.concurrency,
+    req.acuc?.org_id,
+  );
   const sc: StoredCrawl = {
     originUrl: req.body.url,
     crawlerOptions: toV0CrawlerOptions(finalCrawlerOptions),
@@ -194,9 +200,7 @@ export async function crawlController(
     createdAt: Date.now(),
     maxConcurrency:
       req.body.maxConcurrency !== undefined
-        ? req.acuc?.concurrency !== undefined
-          ? Math.min(req.body.maxConcurrency, req.acuc.concurrency)
-          : req.body.maxConcurrency
+        ? Math.min(req.body.maxConcurrency, effectiveConcurrency)
         : undefined,
     zeroDataRetention,
   };

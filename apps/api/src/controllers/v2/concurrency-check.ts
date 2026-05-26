@@ -8,6 +8,7 @@ import { Response } from "express";
 import { getRedisConnection } from "../../../src/services/queue-service";
 import { getACUCTeam } from "../auth";
 import { RateLimiterMode } from "../../types";
+import { autumnService } from "../../services/autumn/autumn.service";
 
 // Basically just middleware and error wrapping
 export async function concurrencyCheckController(
@@ -46,9 +47,18 @@ export async function concurrencyCheckController(
     Infinity,
   );
 
+  const autumnConcurrency = await autumnService.getConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc.org_id,
+  );
+
   return res.status(200).json({
     success: true,
     concurrency: activeJobsOfTeam.length,
-    maxConcurrency: Math.max(req.acuc.concurrency, otherACUC?.concurrency ?? 0),
+    maxConcurrency: Math.max(
+      req.acuc.concurrency,
+      otherACUC?.concurrency ?? 0,
+      autumnConcurrency ?? 0,
+    ),
   });
 }

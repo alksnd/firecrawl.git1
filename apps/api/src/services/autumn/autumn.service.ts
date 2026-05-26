@@ -18,6 +18,7 @@ import type {
 
 const TEAM_FEATURE_ID = "TEAM";
 const CREDITS_FEATURE_ID = "CREDITS";
+const CONCURRENCY_FEATURE_ID = "CONCURRENCY";
 
 /**
  * Org IDs that always have Autumn enabled, regardless of experiment
@@ -572,6 +573,63 @@ export class AutumnService {
         },
       );
       return false;
+    }
+  }
+
+  // Cache CONCURRENCY balance lookups briefly so concurrency enforcement on
+  // every scrape/crawl/browser request doesn't fan out to Autumn each time.
+  private concurrencyLimitCache = new BoundedMap<
+    string,
+    { value: number | null; expiresAt: number }
+  >(50_000);
+  private static readonly CONCURRENCY_LIMIT_TTL_MS = 60_000;
+
+  /**
+   * Reads the team's allowed concurrent-browser count from Autumn's
+   * entity-scoped CONCURRENCY balance. Each team has its own Autumn entity, so
+   * the entity balance is per-team regardless of whether the org has one or
+   * many teams. Returns null when Autumn is unavailable, the entity is missing,
+   * or there's no balance — callers should take the max with the ACUC value.
+   */
+  async getConcurrencyLimit(
+    teamId: string,
+    orgId?: string | null,
+  ): Promise<number | null> {
+    if (!autumnClient || this.isPreviewTeam(teamId)) return null;
+
+    const now = Date.now();
+    const cached = this.concurrencyLimitCache.get(teamId);
+    if (cached && cached.expiresAt > now) return cached.value;
+
+    try {
+      const resolvedOrgId = orgId ?? (await this.resolveOrgId(teamId));
+      if (!resolvedOrgId) return null;
+
+      const entity: any = await autumnClient.entities.get({
+        customerId: resolvedOrgId,
+        entityId: teamId,
+      });
+      const remaining = entity?.balances?.[CONCURRENCY_FEATURE_ID]?.remaining;
+      const value = typeof remaining === "number" ? remaining : null;
+      this.concurrencyLimitCache.set(teamId, {
+        value,
+        expiresAt: now + AutumnService.CONCURRENCY_LIMIT_TTL_MS,
+      });
+      return value;
+    } catch (error) {
+      const status = this.getErrorStatus(error);
+      if (status === 404) {
+        this.concurrencyLimitCache.set(teamId, {
+          value: null,
+          expiresAt: now + AutumnService.CONCURRENCY_LIMIT_TTL_MS,
+        });
+        return null;
+      }
+      logger.error(
+        "Autumn getConcurrencyLimit failed — billing API may be unavailable",
+        { teamId, error },
+      );
+      return null;
     }
   }
 

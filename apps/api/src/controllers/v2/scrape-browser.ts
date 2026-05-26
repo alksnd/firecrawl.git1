@@ -21,6 +21,7 @@ import {
   getConcurrencyLimitActiveJobsCount,
   pushConcurrencyLimitActiveJob,
   removeConcurrencyLimitActiveJob,
+  getEffectiveConcurrencyLimit,
 } from "../../lib/concurrency-limit";
 import {
   browserServiceRequest,
@@ -532,7 +533,11 @@ async function createSessionForScrape(
   }
 
   // Active session limit — uses the same concurrency pool as scrape/crawl
-  const concurrencyLimit = req.acuc?.concurrency ?? 2;
+  const concurrencyLimit = await getEffectiveConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc?.concurrency,
+    req.acuc?.org_id,
+  );
   const activeCount = await getConcurrencyLimitActiveJobsCount(
     req.auth.team_id,
   );

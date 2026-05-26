@@ -9,6 +9,7 @@ import {
   getConcurrencyLimitActiveJobsCount,
   getConcurrencyQueueJobsCount,
 } from "../../lib/concurrency-limit";
+import { autumnService } from "../../services/autumn/autumn.service";
 
 type QueueStatusResponse = {
   success: boolean;
@@ -51,6 +52,11 @@ export async function queueStatusController(
     "most-recent-success:" + req.auth.team_id,
   );
 
+  const autumnConcurrency = await autumnService.getConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc?.org_id,
+  );
+
   return res.status(200).json({
     success: true,
 
@@ -60,6 +66,7 @@ export async function queueStatusController(
     maxConcurrency: Math.max(
       req.acuc?.concurrency ?? 1,
       otherACUC?.concurrency ?? 1,
+      autumnConcurrency ?? 0,
     ),
 
     mostRecentSuccess: mostRecentSuccess

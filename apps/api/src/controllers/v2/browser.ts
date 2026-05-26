@@ -21,6 +21,7 @@ import {
   getConcurrencyLimitActiveJobsCount,
   pushConcurrencyLimitActiveJob,
   removeConcurrencyLimitActiveJob,
+  getEffectiveConcurrencyLimit,
 } from "../../lib/concurrency-limit";
 import { RequestWithAuth } from "./types";
 import { billTeam } from "../../services/billing/credit_billing";
@@ -244,7 +245,11 @@ export async function browserCreateController(
   }
 
   // 0b. Enforce concurrency limit (shared pool with scrape/crawl/interact)
-  const concurrencyLimit = req.acuc?.concurrency ?? 2;
+  const concurrencyLimit = await getEffectiveConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc?.concurrency,
+    req.acuc?.org_id,
+  );
   const activeCount = await getConcurrencyLimitActiveJobsCount(
     req.auth.team_id,
   );

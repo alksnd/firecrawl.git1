@@ -5,6 +5,23 @@ import { getCrawl, StoredCrawl } from "./crawl-redis";
 import { logger } from "./logger";
 import { abTestJob } from "../services/ab-test";
 import { scrapeQueue, type NuQJob } from "../services/worker/nuq";
+import { autumnService } from "../services/autumn/autumn.service";
+
+/**
+ * Returns the team's effective concurrency limit as the max of the ACUC value
+ * and whatever Autumn reports for the CONCURRENCY feature. Either source can
+ * be the higher one (overrides on either side), so we take the max instead of
+ * picking just one. When ACUC is missing we use the legacy default of 2.
+ */
+export async function getEffectiveConcurrencyLimit(
+  teamId: string,
+  acucConcurrency: number | null | undefined,
+  orgId?: string | null,
+): Promise<number> {
+  const acucValue = acucConcurrency ?? 2;
+  const autumnValue = await autumnService.getConcurrencyLimit(teamId, orgId);
+  return Math.max(acucValue, autumnValue ?? 0);
+}
 
 export class QueueFullError extends Error {
   statusCode = 429;
@@ -337,15 +354,17 @@ export async function concurrentJobDone(job: NuQJob<any>) {
       await cleanOldCrawlConcurrencyLimitEntries(job.data.crawl_id);
     }
 
-    const maxTeamConcurrency =
-      (
-        await getACUCTeam(
-          job.data.team_id,
-          false,
-          true,
-          job.data.is_extract ? RateLimiterMode.Extract : RateLimiterMode.Crawl,
-        )
-      )?.concurrency ?? 2;
+    const acuc = await getACUCTeam(
+      job.data.team_id,
+      false,
+      true,
+      job.data.is_extract ? RateLimiterMode.Extract : RateLimiterMode.Crawl,
+    );
+    const maxTeamConcurrency = await getEffectiveConcurrencyLimit(
+      job.data.team_id,
+      acuc?.concurrency,
+      acuc?.org_id,
+    );
 
     let staleSkipped = 0;
     while (staleSkipped < 100) {
