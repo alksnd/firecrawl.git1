@@ -273,7 +273,20 @@ export async function markBrowserSessionUsedPrompt(
   sessionId: string,
 ): Promise<void> {
   try {
+
+    const cached = await getValue(cacheKey);
+    if (cached !== null) {
+      const parsed = Number(cached);
+      if (Number.isInteger(parsed) && parsed >= 0) {
+        return parsed;
+      }
+      logger.warn("Invalid cached browser session count, ignoring cache", {
+        teamId,
+      });
+    }
+
     await setValue(promptFlagKey(sessionId), "1", PROMPT_FLAG_TTL_SECONDS);
+
   } catch {
     // Redis down — non-fatal, will fall back to standard rate at billing time
   }
