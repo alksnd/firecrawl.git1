@@ -22,7 +22,12 @@ import { Request } from "express";
 export function getRequestHostname(req: Request): string | undefined {
   const configured = process.env.SELF_HOSTED_DOMAIN?.trim();
   if (configured) {
-    return normalizeHost(configured);
+    const normalized = normalizeHost(configured);
+    if (normalized) {
+      return normalized;
+    }
+    // A misconfigured SELF_HOSTED_DOMAIN (e.g. contains spaces) must not leak
+    // into the URL; fall through to the request-derived host instead.
   }
 
   const forwardedHost = req.get("x-forwarded-host");
@@ -39,12 +44,14 @@ export function getRequestHostname(req: Request): string | undefined {
 /**
  * Reduce a user-supplied domain to a bare `host[:port]`. Accepts values with or
  * without a scheme (`example.com`, `https://example.com`, `https://example.com/x`).
+ * Returns undefined when the value cannot be parsed into a host, so callers do
+ * not emit a malformed value.
  */
-function normalizeHost(value: string): string {
+function normalizeHost(value: string): string | undefined {
   try {
     const withScheme = value.includes("://") ? value : `http://${value}`;
-    return new URL(withScheme).host;
+    return new URL(withScheme).host || undefined;
   } catch {
-    return value;
+    return undefined;
   }
 }

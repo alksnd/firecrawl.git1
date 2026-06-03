@@ -52,6 +52,12 @@ describe("getRequestHostname", () => {
     expect(getRequestHostname(req)).toBe("localhost:3002");
   });
 
+  it("falls through to the request host when SELF_HOSTED_DOMAIN is unparseable", () => {
+    process.env.SELF_HOSTED_DOMAIN = "not a valid host";
+    const req = mockReq({ host: "localhost:3002" });
+    expect(getRequestHostname(req)).toBe("localhost:3002");
+  });
+
   it("uses the first X-Forwarded-Host when no domain is configured", () => {
     delete process.env.SELF_HOSTED_DOMAIN;
     const req = mockReq({
