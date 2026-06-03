@@ -15,6 +15,7 @@ import {
   getDoneJobsOrderedUntil,
   isCrawlKickoffFinished,
 } from "../../lib/crawl-redis";
+import { getRequestHostname } from "../../lib/host-utils";
 import {
   supabaseGetScrapeById,
   supabaseGetScrapesById,
@@ -325,7 +326,7 @@ export async function crawlStatusController(
     next:
       (outputBulkA.total ?? 0) > start + iteratedOver ||
       outputBulkA.status !== "completed"
-        ? `${req.protocol}://${req.get("host")}/v2/${isBatch ? "batch/scrape" : "crawl"}/${req.params.jobId}?skip=${start + iteratedOver}${req.query.limit ? `&limit=${req.query.limit}` : ""}`
+        ? `${req.protocol}://${getRequestHostname(req)}/v2/${isBatch ? "batch/scrape" : "crawl"}/${req.params.jobId}?skip=${start + iteratedOver}${req.query.limit ? `&limit=${req.query.limit}` : ""}`
         : undefined,
   };
 

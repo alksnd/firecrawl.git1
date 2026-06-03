@@ -19,6 +19,7 @@ import {
   saveCrawl,
   StoredCrawl,
 } from "../../lib/crawl-redis";
+import { getRequestHostname } from "../../lib/host-utils";
 import { getJobPriority } from "../../lib/job-priority";
 import { addScrapeJobs } from "../../services/queue-jobs";
 import { createWebhookSender, WebhookEvent } from "../../services/webhook";
@@ -51,7 +52,8 @@ export async function batchScrapeController(
   }
 
   const zeroDataRetention =
-    getScrapeZDR(req.acuc?.flags) === "forced" || (req.body.zeroDataRetention ?? false);
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    (req.body.zeroDataRetention ?? false);
 
   if (
     req.body.__agentInterop &&
@@ -272,7 +274,7 @@ export async function batchScrapeController(
   return res.status(200).json({
     success: true,
     id,
-    url: `${protocol}://${req.get("host")}/v2/batch/scrape/${id}`,
+    url: `${protocol}://${getRequestHostname(req)}/v2/batch/scrape/${id}`,
     invalidURLs,
   });
 }
