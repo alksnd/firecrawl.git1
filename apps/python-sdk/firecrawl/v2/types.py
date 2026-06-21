@@ -612,7 +612,7 @@ class ChangeTrackingFormat(Format):
     tag: Optional[str] = None
 
 
-class ScreenshotFormat(BaseModel):
+class ScreenshotFormat(Format):
     """Configuration for screenshot format."""
 
     type: Literal["screenshot"] = "screenshot"
