@@ -51,6 +51,7 @@ export type FireEngineScrapeRequestCommon = {
   mobileProxy?: boolean; // leave it undefined if user doesn't specify
 
   timeout?: number;
+  maxAge?: number;
   saveScrapeResultToGCS?: boolean;
   zeroDataRetention?: boolean;
 };
