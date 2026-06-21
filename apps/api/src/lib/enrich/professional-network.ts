@@ -13,12 +13,12 @@ type RouteInput = {
 const SUPPORTED_FORMATS = new Set(["markdown", "json", "deterministicJson"]);
 const PROFESSIONAL_NETWORK_SUCCESS_CREDITS = 15;
 
-export function isConfiguredProfessionalNetworkHost(inputUrl: string): boolean {
+function parseConfiguredProfessionalNetworkUrl(inputUrl: string): URL | null {
   let parsed: URL;
   try {
     parsed = new URL(inputUrl);
   } catch {
-    return false;
+    return null;
   }
 
   const host = parsed.hostname.toLowerCase();
@@ -26,7 +26,61 @@ export function isConfiguredProfessionalNetworkHost(inputUrl: string): boolean {
     (config.ENRICH_URL_HOSTS ?? []).map(x => x.toLowerCase()),
   );
 
-  return allowedHosts.size > 0 && allowedHosts.has(host);
+  return allowedHosts.size > 0 && allowedHosts.has(host) ? parsed : null;
+}
+
+export function isConfiguredProfessionalNetworkHost(inputUrl: string): boolean {
+  return parseConfiguredProfessionalNetworkUrl(inputUrl) !== null;
+}
+
+export function getProfessionalNetworkRequestLogContext(inputUrl: string):
+  | {
+      url: string;
+      host: string;
+      pathPrefix: string | null;
+    }
+  | undefined {
+  const parsed = parseConfiguredProfessionalNetworkUrl(inputUrl);
+  if (!parsed) {
+    return undefined;
+  }
+
+  return {
+    url: parsed.href,
+    host: parsed.hostname.toLowerCase(),
+    pathPrefix:
+      parsed.pathname
+        .split("/")
+        .map(part => part.trim())
+        .filter(part => part.length > 0)[0] ?? null,
+  };
+}
+
+export function getProfessionalNetworkResponseLogContext(meta: unknown): {
+  cacheState?: string;
+  cachedAt?: string;
+  cacheAgeMs?: number;
+  providerRequestId?: string;
+} {
+  if (typeof meta !== "object" || meta === null) {
+    return {};
+  }
+
+  const record = meta as Record<string, unknown>;
+  const requestId = record.request_id ?? record.requestId;
+
+  return {
+    ...(typeof record.cacheState === "string"
+      ? { cacheState: record.cacheState }
+      : {}),
+    ...(typeof record.cachedAt === "string"
+      ? { cachedAt: record.cachedAt }
+      : {}),
+    ...(typeof record.cacheAgeMs === "number"
+      ? { cacheAgeMs: record.cacheAgeMs }
+      : {}),
+    ...(typeof requestId === "string" ? { providerRequestId: requestId } : {}),
+  };
 }
 
 export function isSupportedProfessionalNetworkFormatRequest(

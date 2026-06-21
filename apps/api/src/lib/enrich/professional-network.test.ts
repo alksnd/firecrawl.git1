@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { config } from "../../config";
 import {
   canBypassProfessionalNetworkBlocklist,
+  getProfessionalNetworkRequestLogContext,
+  getProfessionalNetworkResponseLogContext,
   getProfessionalNetworkSuccessCredits,
   isConfiguredProfessionalNetworkHost,
   isSupportedProfessionalNetworkFormatRequest,
@@ -39,6 +41,41 @@ describe("professional network blocklist bypass", () => {
       ),
     ).toBe(false);
     expect(isConfiguredProfessionalNetworkHost("not a url")).toBe(false);
+  });
+
+  it("builds a compact request log context for configured hosts", () => {
+    expect(
+      getProfessionalNetworkRequestLogContext(
+        "https://profiles.example/person/example-person/details/experience/?trk=foo",
+      ),
+    ).toEqual({
+      url: "https://profiles.example/person/example-person/details/experience/?trk=foo",
+      host: "profiles.example",
+      pathPrefix: "person",
+    });
+
+    expect(
+      getProfessionalNetworkRequestLogContext("https://other.example/person/x"),
+    ).toBeUndefined();
+  });
+
+  it("extracts response cache metadata for logs", () => {
+    expect(
+      getProfessionalNetworkResponseLogContext({
+        cacheState: "hit",
+        cachedAt: "2026-06-21T10:00:00.000Z",
+        cacheAgeMs: 1000,
+        request_id: "req_123",
+        extra: "ignored",
+      }),
+    ).toEqual({
+      cacheState: "hit",
+      cachedAt: "2026-06-21T10:00:00.000Z",
+      cacheAgeMs: 1000,
+      providerRequestId: "req_123",
+    });
+
+    expect(getProfessionalNetworkResponseLogContext(null)).toEqual({});
   });
 
   it("accepts only formats that Fire Engine can return directly", () => {
