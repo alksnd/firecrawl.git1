@@ -41,6 +41,13 @@ const REMOVED_PAGE_CREDITS = 0;
 const X_TWITTER_POSTPROCESSOR_CREDIT_BONUS = 29;
 const DEFAULT_CRAWL_LIMIT_FOR_ESTIMATE = 10000;
 const MONITOR_CHECK_PAGE_BATCH_SIZE = 1000;
+// Flat search-monitor billing: search() bills 2 per 10 results per query; the
+// judge bills 5 per result evaluated. The estimate is an upper bound (all
+// results judged); real runs dedupe + cap, so actual ≤ estimate.
+// SEARCH_JUDGE_CREDITS_PER_RESULT MUST stay in sync with JUDGE_CREDITS_PER_RESULT
+// in ./search/run.ts.
+const SEARCH_CREDITS_PER_TEN_RESULTS = 2;
+const SEARCH_JUDGE_CREDITS_PER_RESULT = 5;
 
 type MonitorCreditMetadata = {
   creditsUsed?: unknown;
@@ -138,10 +145,44 @@ function estimateBaseCreditsPerPage(
   return credits;
 }
 
-function estimateTargetBaseCredits(target: MonitorTarget): number {
+// Upper bound on results the judge could evaluate in one run: every result of
+// every query, before dedupe. Real runs dedupe/cap, so actual ≤ this.
+function estimateSearchJudgedResults(
+  target: Extract<MonitorTarget, { type: "search" }>,
+): number {
+  return Math.max(1, target.maxResults) * Math.max(1, target.queries.length);
+}
+
+function estimateSearchTargetCredits(
+  target: Extract<MonitorTarget, { type: "search" }>,
+  judgeEnabled: boolean,
+): number {
+  const searchCallCredits =
+    Math.ceil(Math.max(1, target.maxResults) / 10) *
+    SEARCH_CREDITS_PER_TEN_RESULTS *
+    Math.max(1, target.queries.length);
+  // No judging in raw mode or when the judge is off.
+  if (target.depth === "raw" || !judgeEnabled) {
+    return searchCallCredits;
+  }
+  return (
+    searchCallCredits +
+    estimateSearchJudgedResults(target) * SEARCH_JUDGE_CREDITS_PER_RESULT
+  );
+}
+
+function estimateTargetBaseCredits(
+  target: MonitorTarget,
+  judgeEnabled: boolean = false,
+): number {
   const creditsPerPage = estimateBaseCreditsPerPage(target.scrapeOptions);
   if (target.type === "scrape") {
     return target.urls.length * creditsPerPage;
+  }
+  if (target.type === "search") {
+    // Full estimate (search + flat judge); excluded from the global per-page
+    // judge loop below to avoid double-counting.
+    return estimateSearchTargetCredits(target, judgeEnabled);
   }
 
   const limit =
@@ -154,6 +195,9 @@ function estimateTargetBaseCredits(target: MonitorTarget): number {
 function estimateTargetPageCount(target: MonitorTarget): number {
   if (target.type === "scrape") {
     return target.urls.length;
+  }
+  if (target.type === "search") {
+    return target.maxResults;
   }
 
   const limit =
@@ -168,13 +212,17 @@ export function estimateMonitorCreditsPerRun(
   judgeEnabled: boolean = false,
 ): number {
   const baseCredits = targets.reduce(
-    (sum, target) => sum + estimateTargetBaseCredits(target),
+    (sum, target) => sum + estimateTargetBaseCredits(target, judgeEnabled),
     0,
   );
+  // Search judging is already folded into estimateTargetBaseCredits above; the
+  // per-page allowance applies only to scrape/crawl, so exclude search here.
   const judgeCredits = judgeEnabled
     ? targets.reduce(
         (sum, target) =>
-          sum + estimateTargetPageCount(target) * JUDGE_CREDITS_PER_PAGE,
+          target.type === "search"
+            ? sum
+            : sum + estimateTargetPageCount(target) * JUDGE_CREDITS_PER_PAGE,
         0,
       )
     : 0;
@@ -254,12 +302,26 @@ export function calculateMonitorCheckActualCreditsFromPages(
       return 0;
     }
 
-    // A persisted judgment means the judge ran for this page. Charge for that
-    // invocation whether the verdict was meaningful or not.
+    // Search judging is billed at the check level; the per-page judge credit
+    // would double-count it. Only scrape/crawl get it.
+    const target = targetsById.get(page.target_id ?? "");
+    if (target?.type === "search") {
+      return 0;
+    }
+
+    // A persisted judgment means the judge ran for this page; charge for it
+    // whether or not the verdict was meaningful.
     return JUDGE_CREDITS_PER_PAGE;
   }
 
   return pages.reduce((total, page) => {
+    // Search pages carry no per-page credit (billed at check level via
+    // flatSearchTargetCredits); summing a per-page base would double-bill.
+    const target = targetsById.get(page.target_id ?? "");
+    if (target?.type === "search") {
+      return total;
+    }
+
     const metadata = page.metadata as MonitorCreditMetadata | null;
     const recordedCredits = metadata?.creditsUsed;
     let baseCredits = fallbackBaseCreditsForPage(page);
@@ -273,6 +335,34 @@ export function calculateMonitorCheckActualCreditsFromPages(
 
     const judgeCredits = judgeCreditsForPage(page);
     return total + baseCredits + judgeCredits;
+  }, 0);
+}
+
+/**
+ * Sum the flat credits recorded on a check's target_results for every search
+ * target (searchCredits + judgeCredits). Persisted when the search completes, so
+ * they're always present at finalization regardless of which pages persisted —
+ * guaranteeing a deep check that judged can never record actual_credits = 0.
+ */
+export function flatSearchTargetCredits(targetResults: unknown): number {
+  if (!Array.isArray(targetResults)) return 0;
+  return targetResults.reduce((total: number, run: unknown) => {
+    if (!run || typeof run !== "object") return total;
+    const r = run as {
+      type?: unknown;
+      searchCredits?: unknown;
+      judgeCredits?: unknown;
+    };
+    if (r.type !== "search") return total;
+    const searchCredits =
+      typeof r.searchCredits === "number" && Number.isFinite(r.searchCredits)
+        ? r.searchCredits
+        : 0;
+    const judgeCredits =
+      typeof r.judgeCredits === "number" && Number.isFinite(r.judgeCredits)
+        ? r.judgeCredits
+        : 0;
+    return total + searchCredits + judgeCredits;
   }, 0);
 }
 
@@ -847,8 +937,12 @@ export async function countMonitorCheckPages(params: {
 export async function calculateMonitorCheckActualCredits(params: {
   checkId: string;
   targets: MonitorTarget[];
+  // The check's persisted target_results; search credits are summed from here so
+  // an empty/missing pages table can't zero them out.
+  targetResults?: unknown;
 }): Promise<number> {
-  let total = 0;
+  // Flat search credits first: deterministic and independent of pages.
+  let total = flatSearchTargetCredits(params.targetResults);
   let offset = 0;
 
   while (true) {

@@ -32,6 +32,7 @@ import {
   toV0CrawlerOptions,
 } from "../../controllers/v2/types";
 import { createWebhookSender, WebhookEvent } from "../webhook";
+import { sendMonitorPageWebhook } from "./results";
 import { sendMonitoringEmailSummary } from "../notification/monitoring_email";
 import {
   calculateMonitorCheckActualCredits,
@@ -64,6 +65,12 @@ import {
   MONITOR_CHECK_STALE_TIMEOUT_MS,
 } from "./stale";
 import { trackMonitorCheckStartedInterest } from "./interest";
+import { runSearchTarget } from "./search/run";
+import { computeGoalVersion } from "./search/dedupe";
+import {
+  reconstructKnownState,
+  searchStatusToPageStatus,
+} from "./search/persist";
 
 const logger = _logger.child({ module: "monitoring-runner" });
 const poll = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -106,6 +113,34 @@ type MonitorTargetRun =
       targetId: string;
       type: "crawl";
       crawlId: string;
+    }
+  | {
+      // Search runs inline during dispatch; counts/credits filled in after.
+      targetId: string;
+      type: "search";
+      // False/undefined until the inline search finishes and stamps its credits.
+      // The reconciler must NOT finalize a check whose search run is still
+      // pending — otherwise it sums credits that haven't been written yet and
+      // bills 0. Set true ONLY once searchCredits/judgeCredits are populated.
+      searchCompleted?: boolean;
+      resultCount?: number;
+      matches?: number;
+      summary?: string;
+      // True when a query failed at the provider after retries (not legitimately
+      // empty); persisted so an empty-but-degraded run isn't read as "no changes".
+      searchDegraded?: boolean;
+      // True when the deep (scrape+judge) path was expected to evaluate results
+      // but evaluated ~none because the per-result scrapes failed; persisted so a
+      // judged check that scraped nothing isn't read as a clean "no changes".
+      judgeDegraded?: boolean;
+      // Human-readable explanation for whichever degraded flag is set.
+      degradedReason?: string | null;
+      // Flat, deterministic credits recorded onto target_results when the search
+      // completes; actual_credits is summed from these, not reconstructed from
+      // per-page metadata, so a missing page / reconciler race can't zero them.
+      searchCredits?: number;
+      judgeCredits?: number;
+      resultsJudged?: number;
     };
 
 function createMonitorTargetRun(target: MonitorTarget): MonitorTargetRun {
@@ -114,6 +149,13 @@ function createMonitorTargetRun(target: MonitorTarget): MonitorTargetRun {
       targetId: target.id,
       type: "scrape",
       expectedJobs: target.urls.map(() => uuidv7()),
+    };
+  }
+
+  if (target.type === "search") {
+    return {
+      targetId: target.id,
+      type: "search",
     };
   }
 
@@ -938,6 +980,154 @@ async function enqueueMonitorCrawlTarget(params: {
   return params.targetRun;
 }
 
+// Runs inline, then persists onto the same monitor_pages / monitor_check_pages
+// tables the reconciler tallies.
+async function runMonitorSearchTarget(params: {
+  monitor: MonitorRow;
+  check: MonitorCheckRow;
+  target: MonitorTarget;
+}): Promise<{
+  pages: PageResult[];
+  resultCount: number;
+  matches: number;
+  summary: string;
+  searchDegraded: boolean;
+  judgeDegraded: boolean;
+  degradedReason: string | null;
+  // Flat, deterministic credits, recorded onto target_results by the caller.
+  searchCredits: number;
+  judgeCredits: number;
+  resultsJudged: number;
+}> {
+  if (params.target.type !== "search") {
+    return {
+      pages: [],
+      resultCount: 0,
+      matches: 0,
+      summary: "",
+      searchDegraded: false,
+      judgeDegraded: false,
+      degradedReason: null,
+      searchCredits: 0,
+      judgeCredits: 0,
+      resultsJudged: 0,
+    };
+  }
+  const { monitor, check, target } = params;
+  const goalVersion = computeGoalVersion(monitor.goal, target.queries);
+
+  // Rebuild per-URL dedup memory + event index from this target's prior pages.
+  const priorPages = await listActiveMonitorPages({
+    monitorId: monitor.id,
+    targetId: target.id,
+  });
+  const { knownPages, knownEvents } = reconstructKnownState(
+    priorPages,
+    goalVersion,
+  );
+
+  const result = await runSearchTarget({
+    monitor: {
+      id: monitor.id,
+      teamId: monitor.team_id,
+      goal: monitor.goal,
+      subject: monitor.name,
+      // Read fresh each check so a PATCH/UI toggle takes effect next check.
+      judgeEnabled: Boolean(monitor.judge_enabled),
+    },
+    target: {
+      id: target.id,
+      queries: target.queries,
+      searchWindow: target.searchWindow,
+      // depth/alertMode aren't settable via the API, but stored targets may
+      // still carry them (back-compat), so pass them through.
+      alertMode: target.alertMode ?? "first_match",
+      includeDomains: target.includeDomains,
+      excludeDomains: target.excludeDomains,
+      recheckAfter: target.recheckAfter,
+      maxResults: target.maxResults,
+      depth: target.depth,
+    },
+    goalVersion,
+    knownPages,
+    knownEvents,
+    zeroDataRetention: false,
+    logger: logger.child({
+      monitorId: monitor.id,
+      checkId: check.id,
+      targetId: target.id,
+    }),
+  });
+
+  // Flat, deterministic credits, returned for recording onto target_results.
+  // actual_credits sums from target_results (not per-page metadata), so these
+  // are reliable regardless of page count/ordering/reconciler timing — closing
+  // the old "completed deep check with actual_credits = 0" hole.
+  const searchCredits = result.searchCredits;
+  const judgeCredits = result.judgeCredits;
+
+  // Search pages carry no per-page credit (cost is the flat figure above, billed
+  // once at check level); writing creditsUsed here would double-count.
+  const pages: PageResult[] = result.pageUpserts.map(upsert => {
+    const status = searchStatusToPageStatus(upsert.status);
+    return {
+      check_id: check.id,
+      monitor_id: monitor.id,
+      team_id: monitor.team_id,
+      target_id: target.id,
+      url: upsert.url,
+      url_hash: upsert.urlHash,
+      status,
+      metadata: upsert.metadata,
+      judgment: upsert.judgment ?? null,
+      emailStatus: status,
+    };
+  });
+
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i];
+    await upsertMonitorPage({
+      monitorId: monitor.id,
+      teamId: monitor.team_id,
+      targetId: target.id,
+      url: page.url,
+      source: "discovered",
+      checkId: check.id,
+      scrapeId: null,
+      status: page.status,
+      metadata: page.metadata as Record<string, unknown>,
+    });
+  }
+
+  await insertMonitorCheckPages(pages);
+
+  for (const page of pages) {
+    if (page.status !== "new" && page.status !== "error") continue;
+    await sendMonitorPageWebhook({
+      teamId: monitor.team_id,
+      monitorId: monitor.id,
+      checkId: check.id,
+      url: page.url,
+      status: page.status,
+      error: page.error ?? null,
+      judgment: page.judgment ?? null,
+    });
+  }
+
+  return {
+    pages,
+    resultCount: result.resultCount,
+    matches: result.matches,
+    summary: result.summary,
+    searchDegraded: result.searchDegraded,
+    judgeDegraded: result.judgeDegraded,
+    degradedReason: result.degradedReason,
+    searchCredits,
+    judgeCredits,
+    resultsJudged: result.resultsJudged,
+  };
+}
+
 export async function processMonitorCheckJob(
   job: MonitorCheckJobData,
 ): Promise<void> {
@@ -1029,8 +1219,35 @@ export async function processMonitorCheckJob(
         await enqueueMonitorScrapeTarget({ monitor, check, target, targetRun });
       } else if (target.type === "crawl" && targetRun.type === "crawl") {
         await enqueueMonitorCrawlTarget({ monitor, check, target, targetRun });
+      } else if (target.type === "search" && targetRun.type === "search") {
+        // Search is synchronous: run now and fold the outcome into target_results
+        // so the reconciler (which treats search as complete) finalizes the check.
+        const searchResult = await runMonitorSearchTarget({
+          monitor,
+          check,
+          target,
+        });
+        targetRun.resultCount = searchResult.resultCount;
+        targetRun.matches = searchResult.matches;
+        targetRun.summary = searchResult.summary;
+        targetRun.searchDegraded = searchResult.searchDegraded;
+        targetRun.judgeDegraded = searchResult.judgeDegraded;
+        targetRun.degradedReason = searchResult.degradedReason;
+        // Persisted onto target_results below so they survive to finalization.
+        targetRun.searchCredits = searchResult.searchCredits;
+        targetRun.judgeCredits = searchResult.judgeCredits;
+        targetRun.resultsJudged = searchResult.resultsJudged;
+        // Mark complete LAST, after credits are populated: the reconciler keys
+        // its completeness check on this flag, so it can never finalize (and
+        // bill the as-yet-unstamped, zero credits) while the search — possibly
+        // mid rate-limit retry — is still running.
+        targetRun.searchCompleted = true;
       }
     }
+
+    await updateMonitorCheck(check.id, {
+      target_results: targetResults,
+    });
   } catch (error) {
     if (lockId) {
       await autumnService.finalizeCreditsLock({
@@ -1176,7 +1393,14 @@ async function isMonitorCheckComplete(
   }
 
   for (const target of targetResults) {
-    if (target?.type === "scrape") {
+    if (target?.type === "search") {
+      // Search runs inline during dispatch and stamps searchCompleted=true only
+      // after its flat credits are written. Until then the run is in flight
+      // (e.g. retrying a rate-limited query), so treating it as complete would
+      // let the reconciler finalize with credits still at 0 — the never-zero
+      // guarantee depends on waiting here.
+      if (!target.searchCompleted) return false;
+    } else if (target?.type === "scrape") {
       const expected = Array.isArray(target.expectedJobs)
         ? target.expectedJobs.length
         : 0;
@@ -1398,6 +1622,9 @@ export async function reconcileRunningMonitorChecks(
       const actualCredits = await calculateMonitorCheckActualCredits({
         checkId: check.id,
         targets: monitor.targets,
+        // Flat search credits come from target_results, not page metadata, so a
+        // completed deep check that judged always records them (fixes the old bug).
+        targetResults,
       });
 
       let finalized = await updateMonitorCheck(check.id, {
