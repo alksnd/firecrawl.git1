@@ -39,6 +39,10 @@ import { getBrandingScript } from "./brandingScript";
 import { abTestFireEngine } from "../../../../services/ab-test";
 import { scheduleABComparison } from "../../../../services/ab-test-comparison";
 import { createHash } from "node:crypto";
+import {
+  getProfessionalNetworkRequestLogContext,
+  getProfessionalNetworkResponseLogContext,
+} from "../../../../lib/enrich/professional-network";
 
 /** Default wait (ms) before running the branding script when user did not set waitFor. Lets the page settle so DOM/images are ready and reduces JS errors. */
 const BRANDING_DEFAULT_WAIT_MS = 2000;
@@ -81,178 +85,235 @@ async function performFireEngineScrape<
       "fire-engine.production": production,
       "fire-engine.ab_mode": abTest.mode,
     });
-    const scrape = await fireEngineScrape(
-      meta,
-      logger.child({ method: "fireEngineScrape" }),
-      request,
-      mock,
-      abort,
-      baseUrl,
-    );
 
-    let status: FireEngineCheckStatusSuccess | undefined = undefined;
-    if ((scrape as any).processing) {
-      const errorLimit = 3;
-      let errors: any[] = [];
-
-      while (status === undefined) {
-        if (errors.length >= errorLimit) {
-          logger.error("Error limit hit.", { errors });
-          fireEngineDelete(
-            logger.child({
-              method: "performFireEngineScrape/fireEngineDelete",
-              afterErrors: errors,
-            }),
-            (scrape as any).jobId,
-            mock,
-            undefined,
-            baseUrl,
-          ).catch(e => {
-            logger.error("Failed to delete job from Fire Engine", { error: e });
-          });
-          throw new Error("Error limit hit. See e.cause.errors for errors.", {
-            cause: { errors },
-          });
-        }
-
-        meta.abort.throwIfAborted();
-
-        try {
-          pollCount++;
-          status = await fireEngineCheckStatus(
-            meta,
-            logger.child({ method: "fireEngineCheckStatus" }),
-            (scrape as any).jobId,
-            mock,
-            abort,
-            baseUrl,
-          );
-        } catch (error) {
-          if (error instanceof StillProcessingError) {
-            // nop
-          } else if (
-            error instanceof EngineError ||
-            error instanceof SiteError ||
-            error instanceof SSLError ||
-            error instanceof DNSResolutionError ||
-            error instanceof ActionError ||
-            error instanceof UnsupportedFileError ||
-            error instanceof FEPageLoadFailed ||
-            error instanceof ProxySelectionError ||
-            error instanceof AddFeatureError
-          ) {
-            fireEngineDelete(
-              logger.child({
-                method: "performFireEngineScrape/fireEngineDelete",
-                afterError: error,
-              }),
-              (scrape as any).jobId,
-              mock,
-              undefined,
-              baseUrl,
-            ).catch(e => {
-              logger.error("Failed to delete job from Fire Engine", {
-                error: e,
-              });
-            });
-            logger.debug("Fire-engine scrape job failed.", {
-              error,
-              jobId: (scrape as any).jobId,
-            });
-            throw error;
-          } else if (error instanceof AbortManagerThrownError) {
-            fireEngineDelete(
-              logger.child({
-                method: "performFireEngineScrape/fireEngineDelete",
-                afterError: error,
-              }),
-              (scrape as any).jobId,
-              mock,
-              undefined,
-              baseUrl,
-            ).catch(e => {
-              logger.error("Failed to delete job from Fire Engine", {
-                error: e,
-              });
-            });
-            throw error;
-          } else {
-            errors.push(error);
-            logger.debug(
-              `An unexpeceted error occurred while calling checkStatus. Error counter is now at ${errors.length}.`,
-              { error, jobId: (scrape as any).jobId },
-            );
-            Sentry.captureException(error);
-          }
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    } else {
-      status = scrape as FireEngineCheckStatusSuccess;
+    const professionalNetworkLogContext =
+      getProfessionalNetworkRequestLogContext(request.url);
+    if (professionalNetworkLogContext) {
+      logger.info("Professional network scrape started", {
+        ...professionalNetworkLogContext,
+        engine: request.engine,
+        scrapeId: meta.id,
+        teamId: meta.internalOptions.teamId,
+        maxAge: request.maxAge,
+      });
+      setSpanAttributes(span, {
+        "professional-network.host": professionalNetworkLogContext.host,
+        "professional-network.path_prefix":
+          professionalNetworkLogContext.pathPrefix ?? undefined,
+      });
     }
 
-    await specialtyScrapeCheck(
-      logger.child({
-        method: "performFireEngineScrape/specialtyScrapeCheck",
-      }),
-      status.responseHeaders,
-      status,
-    );
-
-    const contentType =
-      (Object.entries(status.responseHeaders ?? {}).find(
-        x => x[0].toLowerCase() === "content-type",
-      ) ?? [])[1] ?? "";
-
-    if (contentType.includes("application/json")) {
-      status.content = await getInnerJson(status.content);
-    }
-
-    if (status.file) {
-      const content = status.file.content;
-      delete status.file;
-      status.content = Buffer.from(content, "base64").toString("utf8"); // TODO: handle other encodings via Content-Type tag
-    }
-
-    fireEngineDelete(
-      logger.child({
-        method: "performFireEngineScrape/fireEngineDelete",
-      }),
-      (scrape as any).jobId,
-      mock,
-      undefined,
-      baseUrl,
-    ).catch(e => {
-      logger.error("Failed to delete job from Fire Engine", { error: e });
-    });
-
-    if (abTest.mode === "mirror") {
-      scheduleABComparison(
-        meta.url,
-        {
-          content: status.content,
-          pageStatusCode: status.pageStatusCode,
-        },
-        Date.now() - startTime,
-        abTest.mirrorPromise,
-        logger,
+    try {
+      const scrape = await fireEngineScrape(
+        meta,
+        logger.child({ method: "fireEngineScrape" }),
+        request,
+        mock,
+        abort,
+        baseUrl,
       );
+
+      let status: FireEngineCheckStatusSuccess | undefined = undefined;
+      if ((scrape as any).processing) {
+        const errorLimit = 3;
+        let errors: any[] = [];
+
+        while (status === undefined) {
+          if (errors.length >= errorLimit) {
+            logger.error("Error limit hit.", { errors });
+            fireEngineDelete(
+              logger.child({
+                method: "performFireEngineScrape/fireEngineDelete",
+                afterErrors: errors,
+              }),
+              (scrape as any).jobId,
+              mock,
+              undefined,
+              baseUrl,
+            ).catch(e => {
+              logger.error("Failed to delete job from Fire Engine", {
+                error: e,
+              });
+            });
+            throw new Error("Error limit hit. See e.cause.errors for errors.", {
+              cause: { errors },
+            });
+          }
+
+          meta.abort.throwIfAborted();
+
+          try {
+            pollCount++;
+            status = await fireEngineCheckStatus(
+              meta,
+              logger.child({ method: "fireEngineCheckStatus" }),
+              (scrape as any).jobId,
+              mock,
+              abort,
+              baseUrl,
+            );
+          } catch (error) {
+            if (error instanceof StillProcessingError) {
+              // nop
+            } else if (
+              error instanceof EngineError ||
+              error instanceof SiteError ||
+              error instanceof SSLError ||
+              error instanceof DNSResolutionError ||
+              error instanceof ActionError ||
+              error instanceof UnsupportedFileError ||
+              error instanceof FEPageLoadFailed ||
+              error instanceof ProxySelectionError ||
+              error instanceof AddFeatureError
+            ) {
+              fireEngineDelete(
+                logger.child({
+                  method: "performFireEngineScrape/fireEngineDelete",
+                  afterError: error,
+                }),
+                (scrape as any).jobId,
+                mock,
+                undefined,
+                baseUrl,
+              ).catch(e => {
+                logger.error("Failed to delete job from Fire Engine", {
+                  error: e,
+                });
+              });
+              logger.debug("Fire-engine scrape job failed.", {
+                error,
+                jobId: (scrape as any).jobId,
+              });
+              throw error;
+            } else if (error instanceof AbortManagerThrownError) {
+              fireEngineDelete(
+                logger.child({
+                  method: "performFireEngineScrape/fireEngineDelete",
+                  afterError: error,
+                }),
+                (scrape as any).jobId,
+                mock,
+                undefined,
+                baseUrl,
+              ).catch(e => {
+                logger.error("Failed to delete job from Fire Engine", {
+                  error: e,
+                });
+              });
+              throw error;
+            } else {
+              errors.push(error);
+              logger.debug(
+                `An unexpeceted error occurred while calling checkStatus. Error counter is now at ${errors.length}.`,
+                { error, jobId: (scrape as any).jobId },
+              );
+              Sentry.captureException(error);
+            }
+          }
+
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } else {
+        status = scrape as FireEngineCheckStatusSuccess;
+      }
+
+      await specialtyScrapeCheck(
+        logger.child({
+          method: "performFireEngineScrape/specialtyScrapeCheck",
+        }),
+        status.responseHeaders,
+        status,
+      );
+
+      const contentType =
+        (Object.entries(status.responseHeaders ?? {}).find(
+          x => x[0].toLowerCase() === "content-type",
+        ) ?? [])[1] ?? "";
+
+      if (contentType.includes("application/json")) {
+        status.content = await getInnerJson(status.content);
+      }
+
+      if (status.file) {
+        const content = status.file.content;
+        delete status.file;
+        status.content = Buffer.from(content, "base64").toString("utf8"); // TODO: handle other encodings via Content-Type tag
+      }
+
+      fireEngineDelete(
+        logger.child({
+          method: "performFireEngineScrape/fireEngineDelete",
+        }),
+        (scrape as any).jobId,
+        mock,
+        undefined,
+        baseUrl,
+      ).catch(e => {
+        logger.error("Failed to delete job from Fire Engine", { error: e });
+      });
+
+      if (abTest.mode === "mirror") {
+        scheduleABComparison(
+          meta.url,
+          {
+            content: status.content,
+            pageStatusCode: status.pageStatusCode,
+          },
+          Date.now() - startTime,
+          abTest.mirrorPromise,
+          logger,
+        );
+      }
+
+      setSpanAttributes(span, {
+        "fire-engine.poll_count": pollCount,
+        "fire-engine.duration_ms": Date.now() - startTime,
+        "fire-engine.status_code": status.pageStatusCode,
+        "fire-engine.content_length": status.content?.length,
+        "fire-engine.has_screenshot": !!(
+          status.screenshots && status.screenshots.length > 0
+        ),
+        "fire-engine.has_pdf": !!(status as any).pdf,
+        "fire-engine.job_id": (scrape as any).jobId,
+      });
+
+      if (professionalNetworkLogContext) {
+        const responseLogContext = getProfessionalNetworkResponseLogContext(
+          status.meta,
+        );
+        logger.info("Professional network scrape completed", {
+          ...professionalNetworkLogContext,
+          ...responseLogContext,
+          engine: request.engine,
+          scrapeId: meta.id,
+          teamId: meta.internalOptions.teamId,
+          statusCode: status.pageStatusCode,
+          durationMs: Date.now() - startTime,
+          pollCount,
+          fireEngineJobId: (scrape as any).jobId,
+        });
+        setSpanAttributes(span, {
+          "professional-network.cache_state": responseLogContext.cacheState,
+          "professional-network.cached_at": responseLogContext.cachedAt,
+          "professional-network.cache_age_ms": responseLogContext.cacheAgeMs,
+        });
+      }
+
+      return status;
+    } catch (error) {
+      if (professionalNetworkLogContext) {
+        logger.warn("Professional network scrape failed", {
+          ...professionalNetworkLogContext,
+          engine: request.engine,
+          scrapeId: meta.id,
+          teamId: meta.internalOptions.teamId,
+          durationMs: Date.now() - startTime,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          error,
+        });
+      }
+      throw error;
     }
-
-    setSpanAttributes(span, {
-      "fire-engine.poll_count": pollCount,
-      "fire-engine.duration_ms": Date.now() - startTime,
-      "fire-engine.status_code": status.pageStatusCode,
-      "fire-engine.content_length": status.content?.length,
-      "fire-engine.has_screenshot": !!(
-        status.screenshots && status.screenshots.length > 0
-      ),
-      "fire-engine.has_pdf": !!(status as any).pdf,
-      "fire-engine.job_id": (scrape as any).jobId,
-    });
-
-    return status;
   });
 }
 
@@ -362,6 +423,7 @@ export async function scrapeURLWithFireEngineChromeCDP(
       timeout: meta.abort.scrapeTimeout() ?? 300000,
       disableSmartWaitCache: meta.internalOptions.disableSmartWaitCache,
       mobileProxy: meta.featureFlags.has("stealthProxy"),
+      maxAge: meta.options.maxAge,
       saveScrapeResultToGCS:
         !meta.internalOptions.zeroDataRetention &&
         meta.internalOptions.saveScrapeResultToGCS,
@@ -437,18 +499,23 @@ export async function scrapeURLWithFireEngineChromeCDP(
     const audioCookies = (response.actionResults ?? [])
       .filter(x => x.type === "getCookies")
       .flatMap(x => x.result.cookies);
+    const contentType =
+      (Object.entries(response.responseHeaders ?? {}).find(
+        x => x[0].toLowerCase() === "content-type",
+      ) ?? [])[1] ?? undefined;
 
     return {
       url: response.url ?? meta.url,
 
       html: response.content,
+      markdown: contentType?.includes("text/markdown")
+        ? response.content
+        : undefined,
+      json: response.json,
       error: response.pageError,
       statusCode: response.pageStatusCode,
 
-      contentType:
-        (Object.entries(response.responseHeaders ?? {}).find(
-          x => x[0].toLowerCase() === "content-type",
-        ) ?? [])[1] ?? undefined,
+      contentType,
 
       screenshot,
       ...(actions.length > 0
@@ -499,6 +566,7 @@ export async function scrapeURLWithFireEngineTLSClient(
       mobileProxy: meta.featureFlags.has("stealthProxy"),
 
       timeout: meta.abort.scrapeTimeout() ?? 300000,
+      maxAge: meta.options.maxAge,
       saveScrapeResultToGCS:
         !meta.internalOptions.zeroDataRetention &&
         meta.internalOptions.saveScrapeResultToGCS,
@@ -522,18 +590,23 @@ export async function scrapeURLWithFireEngineTLSClient(
         sourceURL: meta.url,
       });
     }
+    const contentType =
+      (Object.entries(response.responseHeaders ?? {}).find(
+        x => x[0].toLowerCase() === "content-type",
+      ) ?? [])[1] ?? undefined;
 
     return {
       url: response.url ?? meta.url,
 
       html: response.content,
+      markdown: contentType?.includes("text/markdown")
+        ? response.content
+        : undefined,
+      json: response.json,
       error: response.pageError,
       statusCode: response.pageStatusCode,
 
-      contentType:
-        (Object.entries(response.responseHeaders ?? {}).find(
-          x => x[0].toLowerCase() === "content-type",
-        ) ?? [])[1] ?? undefined,
+      contentType,
 
       proxyUsed: response.usedMobileProxy ? "stealth" : "basic",
       timezone: response.timezone,
